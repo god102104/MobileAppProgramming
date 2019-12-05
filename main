@@ -1,0 +1,568 @@
+package com.example.weatherwidget.view;
+
+import android.Manifest;
+import android.app.AlarmManager;
+import android.app.PendingIntent;
+import android.app.TimePickerDialog;
+import android.content.Context;
+import android.content.DialogInterface;
+import android.content.Intent;
+import android.content.SharedPreferences;
+import android.location.LocationManager;
+import android.os.Bundle;
+import android.provider.Settings;
+import android.util.Log;
+import android.view.ViewGroup;
+import android.widget.TimePicker;
+import android.widget.Toast;
+
+import androidx.annotation.Nullable;
+import androidx.appcompat.app.AlertDialog;
+import androidx.appcompat.app.AppCompatActivity;
+import androidx.databinding.DataBindingUtil;
+
+import com.example.weatherwidget.R;
+import com.example.weatherwidget.databinding.ActivityMainBinding;
+import com.example.weatherwidget.model.Grid;
+import com.example.weatherwidget.model.forecastgrib.ForecastGribResponse;
+import com.example.weatherwidget.model.msrstn_accto_rltm_mesure_dnsty.MsrstnAcctoRltmMesureDnsty;
+import com.example.weatherwidget.model.nearby_msrstn_list.NearbyMsrstnList;
+import com.example.weatherwidget.model.sgis_access_token.SgisAccessToken;
+import com.example.weatherwidget.model.sgis_transcoord.SgisTranscoord;
+import com.example.weatherwidget.task.AirkoreaApi;
+import com.example.weatherwidget.task.Newsky2Api;
+import com.example.weatherwidget.task.SgisApi;
+import com.example.weatherwidget.view.calendar.CalendarActivity;
+import com.example.weatherwidget.view.clock.ClockActivity;
+import com.google.android.gms.location.FusedLocationProviderClient;
+import com.google.android.gms.location.LocationCallback;
+import com.google.android.gms.location.LocationRequest;
+import com.google.android.gms.location.LocationResult;
+import com.google.android.gms.location.LocationServices;
+import com.gun0912.tedpermission.PermissionListener;
+import com.gun0912.tedpermission.TedPermission;
+
+import java.text.SimpleDateFormat;
+import java.util.Calendar;
+import java.util.Date;
+import java.util.List;
+import java.util.TimeZone;
+
+import eightbitlab.com.blurview.RenderScriptBlur;
+import retrofit2.Call;
+import retrofit2.Callback;
+import retrofit2.Response;
+import retrofit2.Retrofit;
+import retrofit2.converter.gson.GsonConverterFactory;
+
+public class MainActivity extends AppCompatActivity implements PermissionListener {
+    private AlarmManager alarmManager;
+    private PendingIntent pi;
+    private boolean clock_status = false;
+    private ActivityMainBinding mActivityMainBinding = null;
+
+    private FusedLocationProviderClient mFusedLocationClient = null;
+    private final LocationCallback mfLocationCallback = new LocationCallback() {
+        @Override
+        public void onLocationResult(LocationResult locationResult) {
+            super.onLocationResult(locationResult);
+            /*
+                FusedLocationProviderClient의 requestLocationUpdates는 위치 변경시 지속적으로
+                현재 메서드를 호출합니다.
+
+                하지만 우리는 딱 한번만 현재위치가 필요하기 때문에 callback을 제거해줍니다
+             */
+            mFusedLocationClient.removeLocationUpdates(mfLocationCallback);
+
+            adjust(locationResult.getLastLocation().getLatitude(), locationResult.getLastLocation().getLongitude());
+        }
+    };
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        load();
+        mActivityMainBinding = DataBindingUtil.setContentView(this, R.layout.activity_main);
+        mActivityMainBinding.setMainActivity(this);
+
+        alarmManager = (AlarmManager) getSystemService(ALARM_SERVICE);
+        /*
+            배경화면 블러 처리
+         */
+        mActivityMainBinding.appCompatImageViewBackground.setImageResource(R.drawable.background_normal);
+        mActivityMainBinding.blurView.setupWith((ViewGroup) getWindow().getDecorView().findViewById(android.R.id.content))
+                .setFrameClearDrawable(getWindow().getDecorView().getBackground())
+                .setBlurAlgorithm(new RenderScriptBlur(this))
+                .setBlurRadius(1f)
+                .setHasFixedTransformationMatrix(true);
+
+        checkPermission();
+    }
+
+    /*
+        사용자에게 권한을 요청합니다
+
+        모든 권한 허용시 onPermissionGranted
+        하나라도 거절시 onPermissionDenied
+
+        가 호출
+     */
+    private void checkPermission() {
+        TedPermission
+                .with(this)
+                .setPermissionListener(this)
+                .setGotoSettingButton(true)
+                .setDeniedTitle("권한 허용")
+                .setDeniedMessage("원활한 앱 사용을 위해 권한이 필요합니다\n설정으로 이동하여 모든 권한을 수락 하세요")
+                .setPermissions(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION)
+                .check();
+    }
+
+    /*
+        http://newsky2.kma.go.kr/service/SecndSrtpdFrcstInfoService2/ForecastGrib?ServiceKey=TD5T1EapjYVT5OS2BqqOJOwmKvb94OKVrALkhuUHYk6kblyjbcZQUe7AJFYevD3Sa711uDEU1AifpJPzZJQgUQ%3D%3D&_type=json 를 통해
+
+        현재 위치의 날씨를 가져온뒤 UI를 업데이트 합니다
+     */
+    private void adjustWeather(double latitude, double longitude) {
+        Grid grid = new Grid(latitude, longitude);
+
+        Retrofit retrofit = new Retrofit.Builder()
+                .baseUrl("http://newsky2.kma.go.kr/")
+                .addConverterFactory(GsonConverterFactory.create())
+                .build();
+
+        String baseTime = null;
+        String baseDate = null;
+        Calendar calendar = Calendar.getInstance();
+        if (calendar.get(Calendar.MINUTE) < 40) {
+            calendar.add(Calendar.HOUR, -1);
+        }
+        baseDate = new SimpleDateFormat("yyyyMMdd").format(calendar.getTime());
+        baseTime = String.format("%02d00", calendar.get(Calendar.HOUR_OF_DAY));
+
+        Newsky2Api service = retrofit.create(Newsky2Api.class);
+        Call<ForecastGribResponse> call = service.forecastGrib(
+                baseDate,
+                baseTime,
+                grid.getGridX(),
+                grid.getGridY());
+
+        call.enqueue(new Callback<ForecastGribResponse>() {
+            @Override
+            public void onResponse(Call<ForecastGribResponse> call, Response<ForecastGribResponse> response) {
+                if (response.isSuccessful()) {
+                    Double temperature = response.body().getTemperature();
+                    if (temperature != null) {
+                        mActivityMainBinding.appCompatTextViewTemperature.setText(temperature.toString());
+
+                        switch (response.body().getPTY()) {
+                            case NONE:
+                                if (28 <= temperature) {
+                                    mActivityMainBinding.appCompatImageViewSymbol.setImageResource(R.drawable.symbol_sleeveless);
+                                    mActivityMainBinding.appCompatTextViewHint.setText("무더운 날씨가 되겠습니다. 반팔과 반바지 차림이 좋겠습니다.");
+                                } else if ((23 <= temperature) && (temperature < 28)) {
+                                    mActivityMainBinding.appCompatImageViewSymbol.setImageResource(R.drawable.symbol_shirt);
+                                    mActivityMainBinding.appCompatTextViewHint.setText("적당히 더운 날씨입니다. 면바지와 반팔 셔츠가 좋겠네요!");
+                                } else if ((20 <= temperature) && (temperature < 23)) {
+                                    mActivityMainBinding.appCompatImageViewSymbol.setImageResource(R.drawable.symbol_cardigan);
+                                    mActivityMainBinding.appCompatTextViewHint.setText("큰 일교차가 예상됩니다. 얇은 가디건을 준비하세요.");
+                                } else if ((17 <= temperature) && (temperature < 20)) {
+                                    mActivityMainBinding.appCompatImageViewSymbol.setImageResource(R.drawable.symbol_sweater);
+                                    mActivityMainBinding.appCompatTextViewHint.setText("어느덧 가을 날씨가 되어가네요. 얇은 니트나 맨투맨을 꺼내 입어볼까요?");
+                                } else if ((12 <= temperature) && (temperature < 17)) {
+                                    mActivityMainBinding.appCompatImageViewSymbol.setImageResource(R.drawable.symbol_jacket);
+                                    mActivityMainBinding.appCompatTextViewHint.setText("제법 쌀쌀한 하루가 되겠습니다. 자켓이나 야상이 어울리는 날입니다.");
+                                } else if ((9 <= temperature) && (temperature < 12)) {
+                                    mActivityMainBinding.appCompatImageViewSymbol.setImageResource(R.drawable.symbol_trench_coat);
+                                    mActivityMainBinding.appCompatTextViewHint.setText("추위가 다가오고 있습니다. 니트와 트렌치코트를 입기에 적당하네요.");
+                                } else if ((5 <= temperature) && (temperature < 9)) {
+                                    mActivityMainBinding.appCompatImageViewSymbol.setImageResource(R.drawable.symbol_coat);
+                                    mActivityMainBinding.appCompatTextViewHint.setText("점점 날씨가 추워지고 있습니다. 코트를 꺼내 입을 시간이 되었네요.");
+                                } else if (temperature < 5) {
+                                    mActivityMainBinding.appCompatImageViewSymbol.setImageResource(R.drawable.symbol_overcoat);
+                                    mActivityMainBinding.appCompatTextViewHint.setText("동장군이 기승을 부리고 있는 날입니다. 패딩, 목도리, 코트, 무엇이든 다 껴입으세요!");
+                                } else {
+                                    ;
+                                }
+                                break;
+
+                            case SLEET:
+                            case SNOW:
+                                mActivityMainBinding.appCompatImageViewSymbol.setImageResource(R.drawable.symbol_umbrella);
+                                mActivityMainBinding.appCompatTextViewHint.setText("오늘은 온종일 눈이 내리겠습니다. 패딩 또는 두꺼운 코트를 입어볼까요?");
+                                break;
+
+                            case RAIN:
+                            case SHOWER:
+                                mActivityMainBinding.appCompatImageViewSymbol.setImageResource(R.drawable.symbol_umbrella);
+                                mActivityMainBinding.appCompatTextViewHint.setText("오늘은 비가 내릴 가능성이 있습니다. 우산을 챙겨주세요.");
+                                break;
+                        }
+                    }
+
+                    switch (response.body().getPTY()) {
+                        case NONE:
+                            mActivityMainBinding.appCompatTextViewStatus.setText("맑음");
+                            mActivityMainBinding.appCompatImageViewBackground.setImageResource(R.drawable.background_normal);
+                            break;
+
+                        case RAIN:
+                            mActivityMainBinding.appCompatTextViewStatus.setText("비");
+                            mActivityMainBinding.appCompatImageViewBackground.setImageResource(R.drawable.background_rain);
+                            break;
+
+                        case SLEET:
+                            mActivityMainBinding.appCompatTextViewStatus.setText("진눈꺠비");
+                            mActivityMainBinding.appCompatImageViewBackground.setImageResource(R.drawable.background_cloud);
+                            break;
+
+                        case SNOW:
+                            mActivityMainBinding.appCompatTextViewStatus.setText("눈");
+                            mActivityMainBinding.appCompatImageViewBackground.setImageResource(R.drawable.background_snow);
+                            break;
+
+                        case SHOWER:
+                            mActivityMainBinding.appCompatTextViewStatus.setText("소나기");
+                            mActivityMainBinding.appCompatImageViewBackground.setImageResource(R.drawable.background_rain);
+                            break;
+                    }
+                } else {
+                    Toast.makeText(MainActivity.this, "현재 날씨 불러오기 실패 : " + response.message(), Toast.LENGTH_SHORT).show();
+                }
+            }
+
+            @Override
+            public void onFailure(Call<ForecastGribResponse> call, Throwable throwable) {
+                Toast.makeText(MainActivity.this, "현재 날씨 불러오기 실패 : " + throwable.getMessage(), Toast.LENGTH_SHORT).show();
+            }
+        });
+    }
+
+    /*
+        http://openapi.airkorea.or.kr/openapi/services/rest/ArpltnInforInqireSvc/getMsrstnAcctoRltmMesureDnsty 을 통해
+
+        가장 가까운 미세먼지 관측소의 정보를 가져옵니다
+     */
+    private void adjustFineDustMsrstnAcctoRltmMesureDnsty(final String stationName, final AirkoreaApi service) {
+        Call<MsrstnAcctoRltmMesureDnsty> call = service.getMsrstnAcctoRltmMesureDnsty(stationName);
+
+        call.enqueue(new Callback<MsrstnAcctoRltmMesureDnsty>() {
+            @Override
+            public void onResponse(Call<MsrstnAcctoRltmMesureDnsty> call, Response<MsrstnAcctoRltmMesureDnsty> response) {
+                if (response.isSuccessful()) {
+
+                    /*
+                        가져온 정보를 가지고 미세먼지 관련 UI 작업들을 처리합니다
+                     */
+                    switch (response.body().getList().get(0).getPm10Grade()) {
+                        case "1":
+                            mActivityMainBinding.appCompatImageViewStatus.setImageResource(R.drawable.icon_status_best);
+                            break;
+
+                        case "2":
+                            mActivityMainBinding.appCompatImageViewStatus.setImageResource(R.drawable.icon_status_good);
+                            break;
+
+                        case "3":
+                            mActivityMainBinding.appCompatImageViewStatus.setImageResource(R.drawable.icon_status_bad);
+                            break;
+
+                        case "4":
+                            mActivityMainBinding.appCompatImageViewStatus.setImageResource(R.drawable.icon_status_worst);
+                            break;
+                    }
+                } else {
+                    Toast.makeText(MainActivity.this, "미세먼지 불러오기 실패:MsrstnAcctoRltmMesureDnsty" + response.message(), Toast.LENGTH_SHORT).show();
+                }
+            }
+
+            @Override
+            public void onFailure(Call<MsrstnAcctoRltmMesureDnsty> call, Throwable throwable) {
+                Toast.makeText(MainActivity.this, "미세먼지 불러오기 실패:MsrstnAcctoRltmMesureDnsty" + throwable.getMessage(), Toast.LENGTH_SHORT).show();
+            }
+        });
+    }
+
+    /*
+        http://openapi.airkorea.or.kr/openapi/services/rest/MsrstnInfoInqireSvc/getNearbyMsrstnList 을 통해
+
+        현재 위치 주변의 미세먼지 관측소들을 가까운순으로 가져옵니다
+
+        성공시 adjustFineDustMsrstnAcctoRltmMesureDnsty 호출합니다
+     */
+    private void adjustFineDustNearbyMsrstnList(final double tmX, final double tmY, final AirkoreaApi service) {
+        Call<NearbyMsrstnList> call = service.getNearbyMsrstnList(tmX + "", tmY + "");
+
+        call.enqueue(new Callback<NearbyMsrstnList>() {
+            @Override
+            public void onResponse(Call<NearbyMsrstnList> call, Response<NearbyMsrstnList> response) {
+                if (response.isSuccessful()) {
+                    adjustFineDustMsrstnAcctoRltmMesureDnsty(response.body().getList().get(0).getStationName(), service);
+                } else {
+                    Toast.makeText(MainActivity.this, "미세먼지 불러오기 실패:Nearby" + response.message(), Toast.LENGTH_SHORT).show();
+                }
+            }
+
+            @Override
+            public void onFailure(Call<NearbyMsrstnList> call, Throwable throwable) {
+                Toast.makeText(MainActivity.this, "미세먼지 불러오기 실패:Nearby" + throwable.getMessage(), Toast.LENGTH_SHORT).show();
+            }
+        });
+    }
+
+    /*
+        https://sgisapi.kostat.go.kr/OpenAPI3/transformation/transcoord.json 을 통해
+
+        GPS좌표를 TM좌표로 변환합니다
+
+        성공시 adjustFineDustNearbyMsrstnList 호출합니다
+     */
+    private void adjustFineDustTranscoord(final double latitude, final double longitude, final SgisApi service, final String accessToken) {
+        Call<SgisTranscoord> call = service.transcoord(accessToken, longitude + "", latitude + "");
+
+        call.enqueue(new Callback<SgisTranscoord>() {
+            @Override
+            public void onResponse(Call<SgisTranscoord> call, Response<SgisTranscoord> response) {
+                if (response.isSuccessful()) {
+                    Retrofit retrofit = new Retrofit.Builder()
+                            .baseUrl("http://openapi.airkorea.or.kr/")
+                            .addConverterFactory(GsonConverterFactory.create())
+                            .build();
+
+                    AirkoreaApi service = retrofit.create(AirkoreaApi.class);
+
+                    adjustFineDustNearbyMsrstnList(response.body().getResult().getPosX(), response.body().getResult().getPosY(), service);
+                } else {
+                    Toast.makeText(MainActivity.this, "미세먼지 불러오기 실패:Transcoord" + response.message(), Toast.LENGTH_SHORT).show();
+                }
+            }
+
+            @Override
+            public void onFailure(Call<SgisTranscoord> call, Throwable throwable) {
+                Toast.makeText(MainActivity.this, "미세먼지 불러오기 실패:Transcoord" + throwable.getMessage(), Toast.LENGTH_SHORT).show();
+            }
+        });
+    }
+
+    /*
+        https://sgisapi.kostat.go.kr/OpenAPI3/auth/authentication.json 을 통해
+
+        미세먼지 상태 REST 호출에 필요한(GPS좌표를 TM좌표로 변환할때 쓸) AccessToken을 먼저 받아옵니다
+
+        성공시 adjustFineDustTranscoord 호출합니다
+     */
+    private void adjustFineDustAccessToken(final double latitude, final double longitude, final SgisApi service) {
+        Call<SgisAccessToken> call = service.authentication();
+
+        call.enqueue(new Callback<SgisAccessToken>() {
+            @Override
+            public void onResponse(Call<SgisAccessToken> call, Response<SgisAccessToken> response) {
+                if (response.isSuccessful()) {
+                    if (response.body().getErrCd() == 0) {
+                        adjustFineDustTranscoord(latitude, longitude, service, response.body().getResult().getAccessToken());
+                    } else {
+                        Toast.makeText(MainActivity.this, "미세먼지 불러오기 실패:" + response.body().getErrMsg(), Toast.LENGTH_SHORT).show();
+                    }
+                } else {
+                    Toast.makeText(MainActivity.this, "미세먼지 불러오기 실패:Token" + response.message(), Toast.LENGTH_SHORT).show();
+                }
+            }
+
+            @Override
+            public void onFailure(Call<SgisAccessToken> call, Throwable throwable) {
+                Toast.makeText(MainActivity.this, "미세먼지 불러오기 실패:Token" + throwable.getMessage(), Toast.LENGTH_SHORT).show();
+            }
+        });
+    }
+
+    private void adjustFineDust(double latitude, double longitude) {
+        Retrofit retrofit = new Retrofit.Builder()
+                .baseUrl("https://sgisapi.kostat.go.kr/")
+                .addConverterFactory(GsonConverterFactory.create())
+                .build();
+
+        SgisApi service = retrofit.create(SgisApi.class);
+
+        adjustFineDustAccessToken(latitude, longitude, service);
+    }
+
+    private void adjust(double latitude, double longitude) {
+        adjustWeather(latitude, longitude);
+        adjustFineDust(latitude, longitude);
+    }
+
+    /*
+        사용자가 모든 권한 수락시
+     */
+    @Override
+    public void onPermissionGranted() {
+        checkGpsDevice(false);
+    }
+
+    /*
+        사용자가 권한 거부 시
+     */
+    @Override
+    public void onPermissionDenied(List<String> deniedPermissions) {
+        Toast.makeText(this, "원활한 앱 사용을 위해 권한을 수락 해주세요", Toast.LENGTH_SHORT).show();
+        finish();
+    }
+
+    /*
+        Gps Module이 켜져있는지 확인함
+     */
+    private void checkGpsDevice(boolean fromOnActivityResult) {
+        LocationManager locationManager = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
+        if (locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
+            requestGps();
+        } else {
+            if (fromOnActivityResult) {
+                ;
+            } else {
+                new AlertDialog.Builder(this)
+                        .setTitle("GPS 모듈을 켜주세요")
+//                        .setMessage("GPS 모듈을 켜주세요")
+                        .setCancelable(false)
+                        .setNegativeButton("취소", new DialogInterface.OnClickListener() {
+                            @Override
+                            public void onClick(DialogInterface dialog, int which) {
+                            }
+                        })
+                        .setPositiveButton("설정", new DialogInterface.OnClickListener() {
+                            @Override
+                            public void onClick(DialogInterface dialog, int which) {
+                                startActivityForResult(new Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS), 111);
+                            }
+                        })
+                        .show();
+            }
+        }
+    }
+
+    /*
+        FusedLocationProviderClient로 현재 위치를 획득 요청합니다
+
+        현재위치를 얻으면 mfLocationCallback의 onLocationResult 호출
+     */
+    void requestGps() {
+        mFusedLocationClient = LocationServices.getFusedLocationProviderClient(this);
+        mFusedLocationClient.requestLocationUpdates(new LocationRequest(), mfLocationCallback,null);
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, @Nullable Intent data) {
+        switch (requestCode) {
+            /*
+                Gps Module 켜기 프로세스중, 설정 다녀온 뒤 호출
+             */
+            case 111:
+                checkGpsDevice(true);
+                break;
+
+            /*
+               Gps Activity에서 지도를 꾹누를경우 종료돼며 이곳 LatLng과 함께 옴
+             */
+            case 112:
+                switch (resultCode) {
+                    case RESULT_OK:
+                        adjust(data.getDoubleExtra("latitude", -1), data.getDoubleExtra("longitude", -1));
+                        break;
+                }
+        }
+
+        super.onActivityResult(requestCode, resultCode, data);
+    }
+
+    /*
+        우상단 메뉴 선택시 각각의 액티비티를 열어줍니다
+     */
+    public void onClick(String tag) {
+        switch (tag) {
+            case "calendar":
+                startActivity(new Intent(this, CalendarActivity.class));
+                break;
+
+            case "shop":
+                startActivity(new Intent(this, ShopActivity.class));
+                break;
+
+            case "placeholder":
+                startActivityForResult(new Intent(this, GpsActivity.class), 112);
+                break;
+            case "clock":
+                //알람 안 설치 상태
+                Log.i("clock",String.valueOf(clock_status));
+                if(clock_status == false) {
+                    new AlertDialog.Builder(MainActivity.this).setMessage("알람 설치할까요?").setNegativeButton("Yes",new DialogInterface.OnClickListener(){
+                        @Override
+                        public void onClick(DialogInterface dialog, int which) {
+                            Intent intent = new Intent(MainActivity.this, ClockActivity.class);
+                            pi = PendingIntent.getActivity(MainActivity.this, 0, intent, 0);
+                            Calendar currentTime = Calendar.getInstance();
+                            new TimePickerDialog(MainActivity.this, 0,
+                                    new TimePickerDialog.OnTimeSetListener() {
+                                        @Override
+                                        public void onTimeSet(TimePicker view,
+                                                              int hourOfDay, int minute) {
+                                            Calendar c = Calendar.getInstance();
+                                            // 사용자 설치 시간이 받기
+                                            c.set(Calendar.HOUR_OF_DAY, hourOfDay);
+                                            c.set(Calendar.MINUTE, minute);
+                                            // 알람이 설치하고 알람이 자동할 때 대응 activity자동
+                                            //alarmManager.set(AlarmManager.RTC_WAKEUP, c.getTimeInMillis(), pi);
+                                            alarmManager.setRepeating(AlarmManager.RTC_WAKEUP,c.getTimeInMillis(),60*24*60*1000,pi); //매일 설치된 시간에서 알람 자동
+                                            // 알람 설치완료
+                                            clock_status = true;
+                                            Toast.makeText(MainActivity.this, "Alarm setting completed",
+                                                    Toast.LENGTH_SHORT).show();
+                                        }
+                                    }, currentTime.get(Calendar.HOUR_OF_DAY), currentTime
+                                    .get(Calendar.MINUTE), false).show();
+                        }
+                    }).setPositiveButton("NO", new DialogInterface.OnClickListener() {
+                        @Override
+                        public void onClick(DialogInterface dialog, int which) {
+                            return;
+                        }
+                    }).show();
+
+                }else//알람 설치 상태
+                {
+                    new AlertDialog.Builder(MainActivity.this).setMessage("설치된 알람이 취소할까요?").setNegativeButton("Yes", new DialogInterface.OnClickListener() {
+                        @Override
+                        public void onClick(DialogInterface dialog, int which) {
+                            Intent intent = new Intent(MainActivity.this, ClockActivity.class);
+                            pi = PendingIntent.getActivity(MainActivity.this, 0, intent, 0);
+                           alarmManager.cancel(pi);
+                            clock_status = false;
+                            return;
+                        }
+                    }).setPositiveButton("No", new DialogInterface.OnClickListener() {
+                        @Override
+                        public void onClick(DialogInterface dialog, int which) {
+                            return;
+                        }
+                    }).show();
+                }
+                break;
+        }
+    }
+ // App 끝날 떄 알람이 설치 여부의 상태 저장
+    @Override
+    protected void onStop() {
+        super.onStop();
+        save();
+    }
+    public void save() {
+        SharedPreferences sp = MainActivity.this.getSharedPreferences("mysp", Context.MODE_PRIVATE);
+        SharedPreferences.Editor editor = sp.edit();
+        editor.putBoolean("clock", clock_status);
+        editor.commit();
+    }
+    public void load(){
+        SharedPreferences sp = MainActivity.this.getSharedPreferences("mysp", Context.MODE_PRIVATE);
+        clock_status = sp.getBoolean("clock", false);
+
+    }
+
+}
